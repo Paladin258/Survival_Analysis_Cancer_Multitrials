@@ -1,0 +1,1814 @@
+---
+title: "Codes_Forest_KM_Plots"
+author: "Nam/Brandon"
+date: "3/27/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+## Load Library
+
+```{r, include=FALSE}
+library(tidyverse)
+library(SummarizedExperiment)
+library(ggplot2)
+library(purrr)
+library(ggbiplot)
+library(RColorBrewer)
+library(dplyr)
+library(MultiAssayExperiment)
+library(ggpubr)
+library(survival)
+library(lubridate)
+library(ggsurvfit)
+library(gtsummary)
+library(colorspace)
+library(tidycmprsk)
+#library(condsurv)
+library(survminer)
+library(GSVA)
+library(mice)
+library(ComplexHeatmap)
+library(metafor)
+library(decoupleR)
+library(tidyestimate)
+library(parallel)
+library(future.apply)
+```
+
+
+## Load Data
+```{r}
+se.bind <- readRDS("/gstore/project/nam_metadata_analysis/Working_Data/se.bind_V5.rds") ## Load SE object
+df_pdata  <- as.data.frame(colData(se.bind)) ## Load phenotype data
+
+df_pdata  <- df_pdata  %>%
+  mutate(STUDY = case_when(
+    STUDY ==  "COTEZO_IMblaze370" ~ "IMblaze370",
+    TRUE ~ as.character(df_pdata$STUDY)
+  ))
+## Drop lowly expressed genes and non protein-coding genes
+filt_count_TPM <- se.bind[rowData(se.bind)$type=="protein_coding",]
+## Convert genes of count matrix 
+rownames(filt_count_TPM) = rowData(filt_count_TPM)$symbol
+### Filter genes 
+filt_count_TPM  <- assay(filt_count_TPM, "tpm")[rowMeans( assay(filt_count_TPM, "tpm"))>1,]
+
+```
+
+## Simple Heatmap of Cox anlaysis from gene set scores (Top: Atezo. Bottom: non-Atezo)
+```{r}
+## Load gene sets
+genes_set <- readRDS("/gne/web/dev/apache/htdocs/people/kayserb/gene_set_collection/RT-CIT_common-genesets_2023-09-28.rds")
+
+genes_set_names <- names(genes_set)
+## Calculate z score
+gs_score <- gsva(filt_count_TPM, genes_set, method="zscore")
+gs_scoreT <- as.data.frame(t(gs_score))
+## Subset phenotype data for surival analysis
+short_df_pdata <- df_pdata[c("STUDY","CNSR", "colname","OS_month","TRT_CLASS","Study_Type")]
+short_df_pdata <- merge(short_df_pdata, gs_scoreT, by.x="colname", by.y="row.names")
+
+
+# Split the data frame into a list of data frames based on the group_column
+split_df_list <- split(short_df_pdata, short_df_pdata$STUDY)
+
+# Convert the list of data frames into individual data frames (optional)
+list_of_dfs <- lapply(split_df_list, as.data.frame)
+
+# Columns to modify
+columns_to_modify <- names(genes_set)
+
+# Loop through the columns and apply the modification
+for (i in 1:length(list_of_dfs)) {
+  for (col in columns_to_modify) {
+    new_col_name <- paste0(col, "_Status")
+    list_of_dfs[[i]] <- list_of_dfs[[i]] %>%
+      mutate(!!new_col_name := ifelse(.data[[col]] > median(.data[[col]]), "High", "Low")) %>%
+      mutate(!!new_col_name := relevel(as.factor(.data[[new_col_name]]), ref = "Low"))
+  }}
+
+# Bind alldataframes into a big one
+short_df_pdata <- do.call(rbind, list_of_dfs)
+
+## Select atezo and remove studies
+
+short_df_pdata <- short_df_pdata %>% 
+   mutate(CPI_arm = case_when(
+    grepl(c("atezo|pembrolizumab"), TRT_CLASS) ~ "CPI",
+    grepl("not_treated", TRT_CLASS) ~ "not_treated",
+    TRUE ~ "non_CPI"))
+
+short_df_pdata  <- subset(short_df_pdata, !STUDY %in% (c("IMpassion031","CO39721")))
+
+short_df_pdata$new_arm <- paste(short_df_pdata$STUDY, short_df_pdata$TRT_CLASS,sep = "_")  
+
+short_df_pdata_sub <- subset(short_df_pdata, short_df_pdata$CPI_arm %in% c("CPI","non_CPI"))
+
+short_df_pdata_sub$Study_Type <- factor(short_df_pdata_sub$Study_Type, 
+                                 levels = c("Lung Cancer","Bladder Cancer","Renal Cancer","Skin Melanoma",
+                                            "Breast Cancer","GO29779","Colorectal Cancer","Ovarian Cancer"))
+subset_PARAM <- unique(short_df_pdata_sub$new_arm)
+
+## Create a column for treatment
+df_KM <- short_df_pdata_sub ### indicate which type of arms
+Gene_Sig <- list()
+for (i in 1:length(genes_set_names)) {
+  Gene_Sig[i]  <- paste(genes_set_names[i], "_Status", sep = "")
+}
+## Split the data frame into a list of data frames based on the group_column
+split_df_KM <- split(df_KM, factor(df_KM$new_arm, levels = unique(df_KM$new_arm)))
+
+# split_df_KM  <- lapply(split_df_KM , arrange_df)
+
+
+## Create an empty list to store the results
+HR_result_list <- list()
+p_value_result_list <- list()
+## Iterate through each dataframe in the list
+  for (i in seq_along(split_df_KM)) {
+    df <- split_df_KM[[i]]
+    
+    # Get the names of the columns you want to use in the regression
+    columns_to_use <- Gene_Sig  # You can adjust this to specify the columns you want
+    # Create a list to store results for this dataframe
+    hazard_ratio <- list()
+    p_value <- list()
+    # Perform Cox proportional hazards regression for each selected column
+    for (col in columns_to_use) {
+      formula <- as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~", col))
+      res.cox <- coxph(formula, data = df)
+      
+    # Save
+    hazard_ratio[[col]] <- exp(summary(res.cox)$coef[, "coef"])
+    p_value[[col]] <- summary(res.cox)$coefficients[,"Pr(>|z|)"]
+}
+    # Store the df_results list for this dataframe in the overall results_list
+    df_name <- names(split_df_KM)[i]
+    HR_result_list[[df_name]] <- hazard_ratio
+    p_value_result_list[[df_name]] <- p_value
+    
+  } 
+
+# Combine the data frames into a single matrix
+HR_Matrix <- as.matrix(bind_rows(HR_result_list,.id = "ListName"))
+rownames <- HR_Matrix[,1]
+HR_Matrix <- HR_Matrix[,-1]
+HR_Matrix  <- apply(HR_Matrix , 2, as.numeric)
+rownames(HR_Matrix) <- rownames  
+
+pval_Matrix <- as.matrix(bind_rows(p_value_result_list,.id = "ListName"))
+rownames <- pval_Matrix[,1]
+pval_Matrix <- pval_Matrix[,-1]
+pval_Matrix  <- apply(pval_Matrix , 2, as.numeric)
+rownames(pval_Matrix) <- rownames  
+
+column_label <- gsub("_Status", "", colnames(HR_Matrix))
+# column_label <- gsub("BGsigs_", "", column_label)
+
+# Create vector to split group
+
+df_KM_group <- df_KM %>% distinct(new_arm, .keep_all = TRUE)
+df_KM_group <- df_KM_group[,c("new_arm","CPI_arm")]
+
+
+# Add custom column annotations using grid.text 
+heatmap_obj <- Heatmap(log(HR_Matrix), 
+        row_title = "Treatment Arm",
+        column_title = "Gene Set",
+        name = "log HR",
+        column_labels = column_label,
+        column_names_gp = grid::gpar(fontsize = 10),
+        row_names_gp = grid::gpar(fontsize = 10),
+        cluster_columns = TRUE,
+        cluster_rows = FALSE,
+        row_split = df_KM_group$CPI_arm,
+        column_names_rot = 45,
+        heatmap_width = unit(15, "cm"),    # Reduce the width of the heatmap
+        heatmap_height = unit(15, "cm"),
+        cell_fun = function(j, i, x, y, w, h, fill) {
+  if(pval_Matrix[i, j] < 0.001) {
+    grid.text("***", x, y, gp=gpar(fontsize = 10))
+  } else if(pval_Matrix[i, j] < 0.01) {
+    grid.text("**", x, y,gp=gpar(fontsize = 10))
+  }  else if(pval_Matrix[i, j] < 0.05) {
+    grid.text("*", x, y,gp=gpar(fontsize = 10))
+  }
+})
+
+# Move the legend to the left and add a gap
+draw(heatmap_obj, 
+     heatmap_legend_side = "left",  # Position the legend on the left
+     annotation_legend_side = "left")
+```
+
+
+## Cox analysis Heatmap output with two columns for non-CPI and CPI
+```{r}
+#### Pick gene set and Set Up Dataframe
+input2_genesets <- "/gne/web/dev/apache/htdocs/people/kayserb/gene_set_collection/WNT-betacat_genesets.rds"
+genes_set <- readRDS(input2_genesets)
+
+genes_set_names <- names(genes_set)
+
+gs_score <- gsva(filt_count_TPM, genes_set, method="zscore")
+gs_scoreT <- as.data.frame(t(gs_score))
+
+short_df_pdata <- df_pdata[c("STUDY","CNSR", "colname","OS_month","TRT_CLASS","Study_Type")]
+short_df_pdata <- merge(short_df_pdata, gs_scoreT, by.x="colname", by.y="row.names")
+
+
+# Split the data frame into a list of data frames based on the group_column
+split_df_list <- split(short_df_pdata, short_df_pdata$STUDY)
+
+# Convert the list of data frames into individual data frames (optional)
+list_of_dfs <- lapply(split_df_list, as.data.frame)
+
+# Columns to modify
+columns_to_modify <- names(genes_set)
+
+# Loop through the columns and apply the modification
+for (i in 1:length(list_of_dfs)) {
+  for (col in columns_to_modify) {
+    new_col_name <- paste0(col, "_Status")
+    list_of_dfs[[i]] <- list_of_dfs[[i]] %>%
+      mutate(!!new_col_name := ifelse(.data[[col]] > median(.data[[col]]), "High", "Low")) %>%
+      mutate(!!new_col_name := relevel(as.factor(.data[[new_col_name]]), ref = "Low"))
+  }}
+
+# Bind alldataframes into a big one
+short_df_pdata <- do.call(rbind, list_of_dfs)
+
+## Select atezo and remove studies
+
+short_df_pdata <- short_df_pdata %>% 
+   mutate(CPI_arm = case_when(
+    grepl(c("atezo|pembrolizumab"), TRT_CLASS) ~ "CPI",
+    grepl("not_treated", TRT_CLASS) ~ "not_treated",
+    TRUE ~ "non_CPI"))
+
+short_df_pdata  <- subset(short_df_pdata, !STUDY %in% (c("IMpassion031","CO39721")))
+
+short_df_pdata$new_arm <- paste(short_df_pdata$STUDY, short_df_pdata$TRT_CLASS,sep = "_")  
+
+short_df_pdata_sub <- subset(short_df_pdata, short_df_pdata$CPI_arm %in% c("CPI","non_CPI"))
+subset_PARAM <- unique(short_df_pdata_sub$new_arm)
+## Select studyies with CPI and non-CPI 
+unique_study_name <- unique(subset(short_df_pdata_sub,short_df_pdata_sub$CPI_arm == "non_CPI")$STUDY)
+                            
+df_pdata_CPI_pair <- subset(short_df_pdata_sub,short_df_pdata_sub$STUDY %in% unique_study_name)       
+
+## Create a column for treatment
+df_KM <- df_pdata_CPI_pair  
+# Iterate through the list and paste the string to each name
+Gene_Sig <- list()
+for (i in 1:length(genes_set_names)) {
+  Gene_Sig[i]  <- paste(genes_set_names[i], "_Status", sep = "")
+}
+
+# Split the data frame into a list of data frames based on the group_column
+split_df_KM <- split(df_KM, factor(df_KM$new_arm, levels = unique(df_KM$new_arm)))
+
+
+# Create an empty list to store the results
+HR_result_list <- list()
+p_value_result_list <- list()
+# Iterate through each dataframe in the list
+for (i in seq_along(split_df_KM)) {
+  df <- split_df_KM[[i]]
+  
+  # Get the names of the columns you want to use in the regression
+  columns_to_use <- Gene_Sig  # You can adjust this to specify the columns you want
+  # Create a list to store results for this dataframe
+  hazard_ratio <- list()
+  p_value <- list()
+  # Perform Cox proportional hazards regression for each selected column
+  for (col in columns_to_use) {
+    formula <- as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~", col))
+    res.cox <- coxph(formula, data = df)
+    
+    # Save
+    hazard_ratio[[col]] <- exp(summary(res.cox)$coef[, "coef"])
+    p_value[[col]] <- summary(res.cox)$coefficients[,"Pr(>|z|)"]
+  }
+  # Store the df_results list for this dataframe in the overall results_list
+  df_name <- names(split_df_KM)[i]
+  HR_result_list[[df_name]] <- hazard_ratio
+  p_value_result_list[[df_name]] <- p_value
+  
+} 
+
+### Heatmap annotation
+# Specification of colors
+color_map <- list(
+  cancer_type = c("Colorectal Cancer"="chartreuse3",
+                  "Bladder Cancer"="hotpink2","Breast Cancer"="dodgerblue2",
+                  "Lung Cancer"= "gold2",
+                  "Ovarian Cancer"="lightsalmon3","Renal Cancer"="mediumpurple2"),
+  CPI_status = c("CPI"="cyan3","non_CPI"="coral2"))
+
+# Order by studies
+df <- df_pdata_CPI_pair %>%
+  distinct(new_arm, .keep_all = TRUE)
+df <- df %>%
+  arrange(Study_Type, new_arm)
+
+
+df$Study_Type <- factor(df$Study_Type, levels = c("Lung Cancer","Renal Cancer","Skin Melanoma",
+                                            "Breast Cancer","GO29779","Colorectal Cancer",
+                                            "Bladder Cancer","Ovarian Cancer"))
+df <- df %>%
+  arrange(Study_Type)
+
+df$STUDY <- factor(df$STUDY, levels = unique(df$STUDY))
+
+ha <- HeatmapAnnotation(cancer_type = df$Study_Type,
+                        CPI_status = df$CPI_arm, 
+                        col = color_map)
+# Combine the data frames into a single matrix
+HR_Matrix <- as.matrix(bind_rows(HR_result_list,.id = "ListName"))
+rownames <- HR_Matrix[,1]
+HR_Matrix <- HR_Matrix[,-1]
+HR_Matrix  <- apply(HR_Matrix , 2, as.numeric)
+rownames(HR_Matrix) <- rownames  
+HR_Matrix <- t(HR_Matrix)
+HR_Matrix <- HR_Matrix[,df$new_arm]
+HR_Matrix  <- as.matrix(HR_Matrix)
+
+
+pval_Matrix <- as.matrix(bind_rows(p_value_result_list,.id = "ListName"))
+rownames <- pval_Matrix[,1]
+pval_Matrix <- pval_Matrix[,-1]
+pval_Matrix  <- apply(pval_Matrix , 2, as.numeric)
+rownames(pval_Matrix) <- rownames  
+pval_Matrix <- t(pval_Matrix)
+pval_Matrix <- pval_Matrix[,df$new_arm]
+pval_Matrix  <- as.matrix(pval_Matrix)
+
+column_label <- gsub("_Status", "", rownames(HR_Matrix))
+# column_label <- gsub("BGsigs_", "", column_label)
+
+
+# Add custom column annotations using grid.text 
+heatmap_obj <- Heatmap(log(HR_Matrix), 
+                       column_title = "Breast",
+                       bottom_annotation = ha,
+                       name = "log HR",
+                       row_labels = column_label,
+                       column_names_gp = grid::gpar(fontsize = 10),
+                       row_names_gp = grid::gpar(fontsize = 10),
+                       cluster_columns = FALSE,
+                       cluster_rows = TRUE,
+                       column_split = df$STUDY,
+                       column_names_rot = 45,
+                       #heatmap_width = unit(22, "cm"),    # Reduce the width of the heatmap
+                       #heatmap_height = unit(14, "cm"),
+                       cell_fun = function(j, i, x, y, w, h, fill) {
+                         if(pval_Matrix[i, j] < 0.001) {
+                           grid.text("***", x, y, gp=gpar(fontsize = 10))
+                         } else if(pval_Matrix[i, j] < 0.01) {
+                           grid.text("**", x, y,gp=gpar(fontsize = 10))
+                         }  else if(pval_Matrix[i, j] < 0.05) {
+                           grid.text("*", x, y,gp=gpar(fontsize = 10))
+                         }
+                       })
+
+# Move the legend to the left and add a gap
+draw(heatmap_obj, 
+     heatmap_legend_side = "left",  # Position the legend on the left
+     annotation_legend_side = "left")
+```
+
+
+## Cox analysis Forest plot output with Multiple gene scores
+
+```{r}
+#### Pick gene set and Set Up Dataframe
+input1_genesets <- "/gne/web/dev/apache/htdocs/people/kayserb/gene_set_collection/WNT-betacat_genesets.rds" 
+genes_set <- readRDS(input1_genesets)
+genes_set_names <- names(genes_set)
+
+######### ------------------- Calculate Gene Score
+gs_score <- gsva(filt_count_TPM, genes_set, method="zscore")
+gs_scoreT <- as.data.frame(t(gs_score))
+
+######### Make a list of gene score results
+list_gene_score <- lapply(colnames(gs_scoreT), function(x) gs_scoreT[, x, drop = FALSE])
+names(list_gene_score ) <- colnames(gs_scoreT)
+
+#list_gene_score <- norm_wmean_scores_list 
+######### Filter phenotype data to extract important variables
+short_df_pdata <- df_pdata[c("STUDY","Study_Type","CNSR", "colname","OS_month","TRT_CLASS")]
+
+short_df_pdata <- short_df_pdata %>% 
+   mutate(CPI_arm = case_when(
+    grepl(c("atezo|pembrolizumab"), TRT_CLASS) ~ "CPI",
+    grepl("not_treated", TRT_CLASS) ~ "not_treated",
+    TRUE ~ "non_CPI"))
+
+
+short_df_pdata  <- subset(short_df_pdata, !STUDY %in% (c("IMpassion031","CO39721")))
+
+short_df_pdata$new_arm <- paste(short_df_pdata$STUDY, short_df_pdata$TRT_CLASS,sep = "_")  
+
+short_df_pdata_sub <- subset(short_df_pdata, short_df_pdata$CPI_arm %in% c("CPI","non_CPI"))
+
+short_df_pdata_sub$Study_Type <- factor(short_df_pdata_sub$Study_Type, 
+                                 levels = c("Lung Cancer","Bladder Cancer","Renal Cancer","Skin Melanoma",
+                                            "Breast Cancer","GO29779","Colorectal Cancer","Ovarian Cancer"))
+
+
+short_df_pdata_merged <- lapply(list_gene_score, function(x) merge(short_df_pdata_sub , x, by.x = "colname", by.y = "row.names"))
+
+short_df_pdata_merged <- lapply(short_df_pdata_merged, function(x) split(x, x$new_arm))
+
+
+
+######### Make Low vs High categories for each gene set score and set reference
+for (i in seq_along(short_df_pdata_merged)) {
+    col <- names(short_df_pdata_merged[i])
+    new_col_name <- paste0(col, "_Status")
+    df <- short_df_pdata_merged[[i]]
+    for (g in seq_along(df)) {
+    df[[g]] <- df[[g]] %>%
+      mutate(!!new_col_name := ifelse(.data[[col]] > median(.data[[col]]), "High", "Low")) %>% 
+      mutate(!!new_col_name := relevel(as.factor(.data[[new_col_name]]), ref = "Low"))
+    }
+    short_df_pdata_merged[[i]] <- df
+}
+
+### flatten the new_arms back 1 level
+short_df_pdata_merged <- short_df_pdata_merged %>%
+  purrr::map_depth(1, bind_rows, .id = "new_arm") 
+
+############################    Forest Plot ----------------------------------------------------------
+######### split data into nested list for each arm
+df_nested <- lapply(short_df_pdata_merged, function(x) split(x, x$CPI_arm))
+
+subset_PARAM <- unique(short_df_pdata$STUDY) # treatment arm name
+
+# Function to arrange a dataframe by the Grade column
+arrange_df_by_Study_Type <- function(df) {
+  df %>% arrange(Study_Type)
+}
+
+# Apply the arrange function to each dataframe in the nested list
+arranged_nested_list <- lapply(df_nested, function(inner_list) {
+  lapply(inner_list, arrange_df_by_Study_Type)
+})
+
+df_nested <- arranged_nested_list
+######### Perform Coxph through nested list
+res.cox.arm <- list()
+res.cox.gene <- list()
+ for (i in seq_along(df_nested)) {
+
+    df <- df_nested[[i]]
+    
+for (a in seq_along(df)) {
+    df1 <- df[[a]]
+    subset_PARAM <- unique(df1$STUDY)
+    
+    res.cox <- vector("list", length(subset_PARAM))  # Pre-allocation for effCPIency
+
+    for (y in seq_along(subset_PARAM)) {
+        col <- names(df1)[10] #### 9 is the Status column
+        res.cox[[y]] <- coxph(as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~", col)), 
+                               data = subset(df1 , STUDY %in% subset_PARAM[y] )) 
+       
+    }
+    names(res.cox) <- subset_PARAM
+   res.cox.arm[[a]] <- res.cox 
+   
+}
+     names(res.cox.arm) <- names(df)
+   res.cox.gene[[i]] <- res.cox.arm
+
+ }
+   names(res.cox.gene) <- names(df_nested)
+
+##### Clean up cox result through nested list   
+cox.df <- res.cox.gene %>%
+  purrr::map_depth(3, broom::tidy) %>%
+  purrr::map_depth(2, bind_rows, .id = "treatment_arm") 
+
+##### Make label for each treatment arm
+label_list <- list()
+label_list[[1]] <- cox.df[[1]][[1]]$treatment_arm
+label_list[[2]] <- cox.df[[2]][[2]]$treatment_arm
+
+fig_label <- unique(short_df_pdata_sub$CPI_arm)
+##### rma function
+rma_list <- cox.df %>%
+  purrr::map(~ .x %>% 
+               purrr::map(~ rma.uni(yi = .x$estimate, sei = .x$std.error, method = "REML")))
+
+names(rma_list) <- names(df_nested )
+##### Finally make forest plot
+p2 <- list()
+
+for (i in seq_along(rma_list)) {
+  input_list <- rma_list[[i]]
+  title <- names(rma_list)[[i]]
+  
+  p1 <- list()
+  
+  for (f in seq_along(input_list)) {
+    # Store the forest plot
+    p1[[f]] <- forest(input_list[[f]], atransf = exp, xlab = "Hazard ratio", slab = paste0(label_list[[f]]))
+
+    # Add the title to the current plot
+    title(title)
+    mtext(fig_label[[f]], side = 3, line = 0.1, cex = 1) 
+    
+    # Pause to allow time to view the current plot before the next one is generated.
+    # Adjust the pause duration for your preference (this is 1 second).
+    Sys.sleep(1) 
+  }
+  
+  p2[[i]] <- p1
+}
+
+
+```
+
+
+
+## Make two columns for non-CPI and CPI on heatmap  for Weighted gene set
+
+```{r}
+
+#### Pick gene set and Set Up Dataframe
+input3_genesets <- "/gstore/home/nguyen77/gene_sets/breast_gene_set.rds"
+genes_set <- readRDS(input3_genesets)
+
+netscores = run_wmean(filt_count_TPM, network = genes_set, .source = "group_name", .target = "gene_id", .mor = weights, times = 2) %>% 
+  dplyr::filter(statistic != "corr_wmean")
+## set wmean and permutation
+wmean_scores  <- netscores %>% 
+  filter(statistic == "wmean") %>% 
+  dplyr::select("score","source","condition")
+
+wmean_scores_list <- split(wmean_scores, wmean_scores$source)
+wmean_scores_list <- lapply(wmean_scores_list, function(x) {x$source <- NULL; x})
+# Vector of new column names
+new_col_names <- names(wmean_scores_list )
+
+for (i in seq_along(new_col_names)) {
+  df <- wmean_scores_list[[i]]
+  colnames(df)[colnames(df) == "score"] <- new_col_names[[i]]
+  wmean_scores_list[[i]] <- df
+}
+
+######### Filter phenotype data to extract important variables
+short_df_pdata <- df_pdata[c("STUDY","CNSR", "colname","OS_month","TRT_CLASS","Study_Type")]
+
+short_df_pdata <- short_df_pdata %>% 
+   mutate(CPI_arm = case_when(
+    grepl(c("atezo|pembrolizumab"), TRT_CLASS) ~ "CPI",
+    grepl("not_treated", TRT_CLASS) ~ "not_treated",
+    TRUE ~ "non_CPI"))
+
+
+short_df_pdata  <- subset(short_df_pdata, !STUDY %in% (c("IMpassion031","CO39721")))
+
+short_df_pdata$new_arm <- paste(short_df_pdata$STUDY, short_df_pdata$TRT_CLASS,sep = "_")  
+
+
+# Spread the dataframe to create new columns using the 'Key' column
+spread_df <- spread(wmean_scores, key = source, value = score)
+
+short_df_pdata <- merge(short_df_pdata, spread_df, by.x="row.names", by.y="condition")
+
+# Split the data frame into a list of data frames based on the group_column
+split_df_list <- split(short_df_pdata, short_df_pdata$STUDY)
+
+# Convert the list of data frames into individual data frames (optional)
+list_of_dfs <- lapply(split_df_list, as.data.frame)
+
+# Columns to modify
+columns_to_modify <-  unique(netscores$source)
+
+# Loop through the columns and apply the modification to create Status columns with High/Low
+for (i in 1:length(list_of_dfs)) {
+  for (col in columns_to_modify) {
+    new_col_name <- paste0(col, "_Status")
+    list_of_dfs[[i]] <- list_of_dfs[[i]] %>%
+      mutate(!!new_col_name := ifelse(.data[[col]] > median(.data[[col]]), "High", "Low")) %>%
+      mutate(!!new_col_name := relevel(as.factor(.data[[new_col_name]]), ref = "Low"))
+  }}
+
+# Bind alldataframes into a big one
+short_df_pdata <- do.call(rbind, list_of_dfs)
+
+## Select atezo and remove studies
+
+short_df_pdata_sub <- subset(short_df_pdata, short_df_pdata$CPI_arm %in% c("CPI","non_CPI"))
+
+unique_study_name <- unique(subset(short_df_pdata_sub,short_df_pdata_sub$CPI_arm == "non_CPI")$STUDY)
+                            
+df_pdata_CPI_pair <- subset(short_df_pdata_sub,short_df_pdata_sub$STUDY %in% unique_study_name)       
+
+df_KM <- df_pdata_CPI_pair
+subset_PARAM <- unique(df_KM$new_arm) ### indicate which type of arms
+
+# Make names of status columns
+Gene_Sig <- list()
+for (i in 1:length(columns_to_modify)) {
+  Gene_Sig[i]  <- paste(columns_to_modify[i], "_Status", sep = "")}
+
+# Split the data frame into a list of data frames based on the group_column
+split_df_KM <- split(df_KM, factor(df_KM$new_arm, levels = unique(df_KM$new_arm)))
+
+
+# Create an empty list to store the results
+HR_result_list <- list()
+p_value_result_list <- list()
+# Iterate through each dataframe in the list
+for (i in seq_along(split_df_KM)) {
+  df <- split_df_KM[[i]]
+  
+  # Get the names of the columns you want to use in the regression
+  columns_to_use <- Gene_Sig  # You can adjust this to specify the columns you want
+  # Create a list to store results for this dataframe
+  hazard_ratio <- list()
+  p_value <- list()
+  # Perform Cox proportional hazards regression for each selected column
+  for (col in columns_to_use) {
+    formula <- as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~", col))
+    res.cox <- coxph(formula, data = df)
+    
+    # Save
+    hazard_ratio[[col]] <- exp(summary(res.cox)$coef[, "coef"])
+    p_value[[col]] <- summary(res.cox)$coefficients[,"Pr(>|z|)"]
+  }
+  # Store the df_results list for this dataframe in the overall results_list
+  df_name <- names(split_df_KM)[i]
+  HR_result_list[[df_name]] <- hazard_ratio
+  p_value_result_list[[df_name]] <- p_value
+  
+} 
+
+### Heatmap annotation
+# Specification of colors
+color_map <- list(
+  cancer_type = c("Bladder Cancer"="dodgerblue2","Breast Cancer"="hotpink2", 
+                  "Colorectal Cancer"="chartreuse3","Lung Cancer"= "gold2",
+                  "Ovarian Cancer"="lightsalmon3","Renal Cancer"="mediumpurple2"),
+  CPI_status = c("CPI"="cyan3","non_CPI"="coral2"))
+
+
+df <- df_pdata_CPI_pair %>%
+  distinct(new_arm, .keep_all = TRUE)
+df <- df %>%
+  arrange(Study_Type, new_arm)
+
+
+df$Study_Type <- factor(df$Study_Type, levels = c("Lung Cancer","Renal Cancer","Skin Melanoma",
+                                            "Breast Cancer","GO29779","Colorectal Cancer",
+                                            "Bladder Cancer","Ovarian Cancer"))
+df <- df %>%
+  arrange(Study_Type)
+
+df$STUDY <- factor(df$STUDY, levels = unique(df$STUDY))
+
+ha <- HeatmapAnnotation(cancer_type = df$Study_Type,
+                        CPI_status = df$CPI_arm, 
+                        col = color_map)
+# Combine the data frames into a single matrix
+HR_Matrix <- as.matrix(bind_rows(HR_result_list,.id = "ListName"))
+rownames <- HR_Matrix[,1]
+HR_Matrix <- HR_Matrix[,-1]
+HR_Matrix  <- apply(HR_Matrix , 2, as.numeric)
+rownames(HR_Matrix) <- rownames  
+HR_Matrix <- t(HR_Matrix)
+HR_Matrix <- HR_Matrix[,df$new_arm]
+HR_Matrix  <- as.matrix(HR_Matrix)
+
+
+pval_Matrix <- as.matrix(bind_rows(p_value_result_list,.id = "ListName"))
+rownames <- pval_Matrix[,1]
+pval_Matrix <- pval_Matrix[,-1]
+pval_Matrix  <- apply(pval_Matrix , 2, as.numeric)
+rownames(pval_Matrix) <- rownames  
+pval_Matrix <- t(pval_Matrix)
+pval_Matrix <- pval_Matrix[,df$new_arm]
+pval_Matrix  <- as.matrix(pval_Matrix)
+
+column_label <- gsub("_Status", "", rownames(HR_Matrix))
+# column_label <- gsub("BGsigs_", "", column_label)
+
+
+
+# Add custom column annotations using grid.text 
+heatmap_obj <- Heatmap(log(HR_Matrix), 
+                       column_title = "Breast",
+                       bottom_annotation = ha,
+                       name = "log HR",
+                       row_labels = column_label,
+                       column_names_gp = grid::gpar(fontsize = 10),
+                       row_names_gp = grid::gpar(fontsize = 10),
+                       cluster_columns = FALSE,
+                       cluster_rows = TRUE,
+                       column_split = df$STUDY,
+                       column_names_rot = 45,
+                       #heatmap_width = unit(22, "cm"),    # modify heatmap width
+                       #heatmap_height = unit(14, "cm"),   # modify heatmap height
+                       cell_fun = function(j, i, x, y, w, h, fill) {
+                         if(pval_Matrix[i, j] < 0.001) {
+                           grid.text("***", x, y, gp=gpar(fontsize = 10))
+                         } else if(pval_Matrix[i, j] < 0.01) {
+                           grid.text("**", x, y,gp=gpar(fontsize = 10))
+                         }  else if(pval_Matrix[i, j] < 0.05) {
+                           grid.text("*", x, y,gp=gpar(fontsize = 10))
+                         }
+                       })
+
+# Move the legend to the left and add a gap
+draw(heatmap_obj, 
+     heatmap_legend_side = "left",  # Position the legend on the left
+     annotation_legend_side = "left")
+```
+
+
+
+## Forest plot of interaction Coxph individual gene * arm (atezo or non-atezo) -----
+
+
+```{r}
+#### Pick a list of genes for the forest plots
+gene_of_interest <- c("IRF1", "IRF2","ZBP1") 
+gene_count  <- subset(filt_count_TPM, row.names(filt_count_TPM) %in% gene_of_interest) %>% t()
+
+######### Make a list of gene by names
+list_gene <- lapply(colnames(gene_count), function(x) gene_count[, x, drop = FALSE])
+names(list_gene ) <- colnames(gene_count)
+
+######### Filter phenotype data to extract important variables
+short_df_pdata <- df_pdata[c("STUDY","Study_Type","CNSR", "colname","OS_month","TRT_CLASS","LIVER_M_AVALC")]
+
+short_df_pdata <- short_df_pdata %>% 
+  mutate(CPI_arm = case_when(
+    grepl(c("atezo|pembrolizumab"), TRT_CLASS) ~ "CPI",
+    grepl("not_treated", TRT_CLASS) ~ "not_treated",
+    TRUE ~ "non_CPI"))
+
+
+short_df_pdata  <- subset(short_df_pdata, !STUDY %in% (c("IMpassion031","CO39721")))
+short_df_pdata <- subset(short_df_pdata, !(STUDY == "IMmotion150" & TRT_CLASS == "atezo_bev"))
+
+short_df_pdata$new_arm <- paste(short_df_pdata$STUDY, short_df_pdata$TRT_CLASS,sep = "_")  
+
+short_df_pdata_sub <- subset(short_df_pdata, short_df_pdata$CPI_arm %in% c("CPI","non_CPI"))
+short_df_pdata_sub$Study_Type <- factor(short_df_pdata_sub$Study_Type, 
+                                 levels = c("Lung Cancer","Bladder Cancer","Renal Cancer","Skin Melanoma",
+                                            "Breast Cancer","GO29779","Colorectal Cancer","Ovarian Cancer"))
+
+# Pick studies with 2 arms
+unique_study_name <- unique(subset(short_df_pdata_sub,short_df_pdata_sub$CPI_arm == "non_CPI")$STUDY)
+short_df_pdata_sub <- subset(short_df_pdata_sub,short_df_pdata_sub$STUDY %in% unique_study_name)   
+
+# Set arm ref
+short_df_pdata_sub$CPI_arm  <- relevel(as.factor(short_df_pdata_sub$CPI_arm), ref = "non_CPI")
+
+short_df_pdata_merged <- lapply(list_gene, function(x) merge(short_df_pdata_sub , x, by.x = "colname", by.y = "row.names"))
+
+short_df_pdata_merged <- lapply(short_df_pdata_merged, function(x) split(x, x$new_arm))
+
+######### Make Low vs High categories for each gene set score and set reference
+for (i in seq_along(short_df_pdata_merged)) {
+  col <- names(short_df_pdata_merged[i])
+  new_col_name <- paste0(col, "_Status")
+  df <- short_df_pdata_merged[[i]]
+  for (g in seq_along(df)) {
+    df[[g]] <- df[[g]] %>%
+      mutate(!!new_col_name := ifelse(.data[[col]] > median(.data[[col]]), "High", "Low")) %>% 
+      mutate(!!new_col_name := relevel(as.factor(.data[[new_col_name]]), ref = "Low"))
+  }
+  short_df_pdata_merged[[i]] <- df
+}
+
+
+### flatten the new_arms back 1 level
+short_df_pdata_merged <- short_df_pdata_merged %>%
+  purrr::map_depth(1, bind_rows, .id = "new_arm") 
+### Sort by Study_Type
+short_df_pdata_merged <- lapply(short_df_pdata_merged, function(df) {
+  arrange(df, Study_Type)
+})
+
+######### Perform Coxph through nested list
+HR_result_list <- list()
+p_value_result_list <- list()
+for (i in seq_along(short_df_pdata_merged)) {
+  
+  df <- short_df_pdata_merged[[i]]
+    subset_PARAM <- unique(df$STUDY)
+    
+    res.cox <- vector("list", length(subset_PARAM))  # Pre-allocation for effCPIency
+    hazard_ratio <- list()
+    p_value <- list()
+    for (y in seq_along(subset_PARAM)) {
+      col <- names(df)[11] #### 11 is the Status column
+      
+      formula <- as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~ CPI_arm *", col))
+      res.cox <- coxph(formula, data = subset(df , STUDY %in% subset_PARAM[y]))
+      hazard_ratio[[subset_PARAM[y]]] <- exp(summary(res.cox)$coef[, "coef"])[3]
+      p_value[[subset_PARAM[y]]] <- summary(res.cox)$coefficients[,"Pr(>|z|)"][3]
+    }
+    # Store the df_results list for this dataframe in the overall results_list
+    df_name <- names(short_df_pdata_merged)[i]
+    HR_result_list[[df_name]] <- hazard_ratio
+    p_value_result_list[[df_name]] <- p_value
+    
+  }
+
+
+
+### Heatmap annotation
+# Specification of colors
+
+df$STUDY <- factor(df$STUDY, levels = unique(df$STUDY))
+
+
+# Combine the data frames into a single matrix
+HR_Matrix <- as.matrix(bind_rows(HR_result_list,.id = "ListName"))
+rownames <- HR_Matrix[,1]
+HR_Matrix <- HR_Matrix[,-1]
+HR_Matrix  <- apply(HR_Matrix , 2, as.numeric)
+rownames(HR_Matrix) <- rownames  
+HR_Matrix <- t(HR_Matrix)
+#HR_Matrix <- HR_Matrix[,df$new_arm]
+HR_Matrix  <- as.matrix(HR_Matrix)
+
+
+pval_Matrix <- as.matrix(bind_rows(p_value_result_list,.id = "ListName"))
+rownames <- pval_Matrix[,1]
+pval_Matrix <- pval_Matrix[,-1]
+pval_Matrix  <- apply(pval_Matrix , 2, as.numeric)
+rownames(pval_Matrix) <- rownames  
+pval_Matrix <- t(pval_Matrix)
+#pval_Matrix <- pval_Matrix[,df$new_arm]
+pval_Matrix  <- as.matrix(pval_Matrix)
+
+column_label <- gsub("_Status", "", rownames(HR_Matrix))
+# column_label <- gsub("BGsigs_", "", column_label)
+
+
+# Add custom column annotations using grid.text 
+heatmap_obj <- Heatmap(log(HR_Matrix), 
+                       column_title = "Atezo/non-Atezo * gene (High/Low)",
+                       name = "log HR",
+                       row_labels = column_label,
+                       column_names_gp = grid::gpar(fontsize = 10),
+                       row_names_gp = grid::gpar(fontsize = 10),
+                       cluster_columns = FALSE,
+                       cluster_rows = TRUE,
+                       #column_split = df$STUDY,
+                       column_names_rot = 45,
+                       #heatmap_width = unit(22, "cm"),    # Reduce the width of the heatmap
+                       #heatmap_height = unit(14, "cm"),
+                       cell_fun = function(j, i, x, y, w, h, fill) {
+                         if(pval_Matrix[i, j] < 0.001) {
+                           grid.text("***", x, y, gp=gpar(fontsize = 10))
+                         } else if(pval_Matrix[i, j] < 0.01) {
+                           grid.text("**", x, y,gp=gpar(fontsize = 10))
+                         }  else if(pval_Matrix[i, j] < 0.05) {
+                           grid.text("*", x, y,gp=gpar(fontsize = 10))
+                         }
+                       })
+
+# Move the legend to the left and add a gap
+draw(heatmap_obj, 
+     heatmap_legend_side = "left",  # Position the legend on the left
+     annotation_legend_side = "left")
+
+
+
+#################### Make Forest Plot -----------------------
+
+######### Perform Coxph through nested list
+res.cox.arm <- list()
+res.cox.gene <- list()
+for (i in seq_along(short_df_pdata_merged)) {
+  
+  df <- short_df_pdata_merged[[i]]
+  
+    subset_PARAM <- unique(df$STUDY)
+    
+    res.cox <- vector("list", length(subset_PARAM))  # Pre-allocation for effCPIency
+    
+    for (y in seq_along(subset_PARAM)) {
+      col <- names(df)[11] #### 9 is the Status column
+      
+      formula <- as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~ CPI_arm *", col))
+      res.cox <- coxph(formula, data = subset(df , STUDY %in% subset_PARAM[y]))
+      res.cox.arm[[subset_PARAM[y]]] <- res.cox 
+    }
+    #names(res.cox) <- subset_PARAM
+    res.cox.gene[[i]] <- res.cox.arm 
+  }
+names(res.cox.gene) <- names(short_df_pdata_merged)
+  
+##### Clean up cox result through nested list   
+cox.df <- res.cox.gene %>%
+  purrr::map_depth(2, function(cox_result) {
+    cox_tidy <- broom::tidy(cox_result)
+    # Filter out rows where the variable is, in this case: the example is TLS_B
+    cox_tidy %>%  filter(grepl("CPI:", term))
+  }) %>%
+  purrr::map_depth(1, bind_rows, .id = "STUDY")
+##### Make label for each study
+label_list <- list()
+label_list <- cox.df[[1]][["STUDY"]]
+
+##### rma function
+rma_list <- purrr::map(cox.df, 
+                       ~rma.uni(yi = .$estimate, sei = .$std.error, method = "REML"))
+
+##### Finally make forest plot
+p2 <- list()
+
+for (i in seq_along(rma_list)) {
+  input_list <- rma_list[[i]]
+  title <- names(rma_list)[i]
+  
+  # Open a PDF device before the inner loop
+ 
+  
+    p1 <- forest(input_list, atransf = exp, xlab = "Hazard ratio",slab = paste0(label_list))
+    title(paste0(title,"(ARM * Gene)"))
+    p2[[i]] <- p1
+    
+}
+
+
+```
+
+
+
+
+#### Pick gene sets for the forest plots
+input3_genesets <- "/gne/web/dev/apache/htdocs/people/kayserb/gene_set_collection/RT-CIT_common-genesets_2023-09-28.rds"
+
+
+
+```{r}
+input3_genesets <- "/gne/web/dev/apache/htdocs/people/kayserb/gene_set_collection/WNT-betacat_genesets.rds"
+genes_set <- readRDS(input3_genesets)
+
+genes_set_names <- names(genes_set)
+
+gs_score <- gsva(filt_count_TPM, genes_set, method="zscore")
+gs_score_T <- as.matrix(t(gs_score))
+
+######### Make a list of gene by names
+list_gs_score <- lapply(colnames(gs_score_T), function(x) gs_score_T[, x, drop = FALSE])
+names(list_gs_score) <- colnames(gs_score_T)
+######### Filter phenotype data to extract important variables
+short_df_pdata <- df_pdata[c("STUDY","Study_Type","CNSR", "colname","OS_month","TRT_CLASS","LIVER_M_AVALC")]
+
+short_df_pdata <- short_df_pdata %>% 
+  mutate(CPI_arm = case_when(
+    grepl(c("atezo|pembrolizumab"), TRT_CLASS) ~ "CPI",
+    grepl("not_treated", TRT_CLASS) ~ "not_treated",
+    TRUE ~ "non_CPI"))
+
+
+short_df_pdata  <- subset(short_df_pdata, !STUDY %in% (c("IMpassion031","CO39721")))
+short_df_pdata <- subset(short_df_pdata, !(STUDY == "IMmotion150" & TRT_CLASS == "atezo_bev"))
+
+short_df_pdata$new_arm <- paste(short_df_pdata$STUDY, short_df_pdata$TRT_CLASS,sep = "_")  
+
+short_df_pdata_sub <- subset(short_df_pdata, short_df_pdata$CPI_arm %in% c("CPI","non_CPI"))
+short_df_pdata_sub$Study_Type <- factor(short_df_pdata_sub$Study_Type, 
+                                 levels = c("Lung Cancer","Bladder Cancer","Renal Cancer","Skin Melanoma",
+                                            "Breast Cancer","GO29779","Colorectal Cancer","Ovarian Cancer"))
+
+# Pick studies with 2 arms
+unique_study_name <- unique(subset(short_df_pdata_sub,short_df_pdata_sub$CPI_arm == "non_CPI")$STUDY)
+short_df_pdata_sub <- subset(short_df_pdata_sub,short_df_pdata_sub$STUDY %in% unique_study_name)   
+
+# Set arm ref
+short_df_pdata_sub$CPI_arm  <- relevel(as.factor(short_df_pdata_sub$CPI_arm), ref = "non_CPI")
+
+short_df_pdata_merged <- lapply(list_gs_score, function(x) merge(short_df_pdata_sub , x, by.x = "colname", by.y = "row.names"))
+
+short_df_pdata_merged <- lapply(short_df_pdata_merged, function(x) split(x, x$STUDY))
+
+######### Make Low vs High categories for each gene set score and set reference
+for (i in seq_along(short_df_pdata_merged)) {
+  col <- names(short_df_pdata_merged[i])
+  new_col_name <- paste0(col, "_Status")
+  df <- short_df_pdata_merged[[i]]
+  for (g in seq_along(df)) {
+    df[[g]] <- df[[g]] %>%
+      mutate(!!new_col_name := ifelse(.data[[col]] > median(.data[[col]]), "High", "Low")) %>% 
+      mutate(!!new_col_name := relevel(as.factor(.data[[new_col_name]]), ref = "Low"))
+  }
+  short_df_pdata_merged[[i]] <- df
+}
+
+### flatten the new_arms back 1 level
+short_df_pdata_merged <- short_df_pdata_merged %>%
+  purrr::map_depth(1, bind_rows, .id = "STUDY") 
+
+
+# Apply the arrange function to each dataframe in the nested list
+# Function to arrange a dataframe by the Grade column
+arrange_df_by_Study_Type <- function(df) {
+  df %>% arrange(Study_Type)
+}
+
+# Apply the arrange function to each dataframe in the regular list
+short_df_pdata_merged <- lapply(short_df_pdata_merged, arrange_df_by_Study_Type)
+
+
+######### Perform Coxph through nested list
+HR_result_list <- list()
+p_value_result_list <- list()
+for (i in seq_along(short_df_pdata_merged)) {
+  
+  df <- short_df_pdata_merged[[i]]
+    subset_PARAM <- unique(df$STUDY)
+    
+    res.cox <- vector("list", length(subset_PARAM))  # Pre-allocation for effCPIency
+    hazard_ratio <- list()
+    p_value <- list()
+    for (y in seq_along(subset_PARAM)) {
+      col <- names(df)[11] #### 11 is the Status column
+      
+      formula <- as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~ CPI_arm *", col))
+      res.cox <- coxph(formula, data = subset(df , STUDY %in% subset_PARAM[y]))
+      hazard_ratio[[subset_PARAM[y]]] <- exp(summary(res.cox)$coef[, "coef"])[3]
+      p_value[[subset_PARAM[y]]] <- summary(res.cox)$coefficients[,"Pr(>|z|)"][3]
+    }
+    # Store the df_results list for this dataframe in the overall results_list
+    df_name <- names(short_df_pdata_merged)[i]
+    HR_result_list[[df_name]] <- hazard_ratio
+    p_value_result_list[[df_name]] <- p_value
+    
+  }
+
+
+
+### Heatmap annotation
+# Specification of colors
+
+df$STUDY <- factor(df$STUDY, levels = unique(df$STUDY))
+
+
+# Combine the data frames into a single matrix
+HR_Matrix <- as.matrix(bind_rows(HR_result_list,.id = "ListName"))
+rownames <- HR_Matrix[,1]
+HR_Matrix <- HR_Matrix[,-1]
+HR_Matrix  <- apply(HR_Matrix , 2, as.numeric)
+rownames(HR_Matrix) <- rownames  
+HR_Matrix <- t(HR_Matrix)
+#HR_Matrix <- HR_Matrix[,df$new_arm]
+HR_Matrix  <- as.matrix(HR_Matrix)
+
+
+pval_Matrix <- as.matrix(bind_rows(p_value_result_list,.id = "ListName"))
+rownames <- pval_Matrix[,1]
+pval_Matrix <- pval_Matrix[,-1]
+pval_Matrix  <- apply(pval_Matrix , 2, as.numeric)
+rownames(pval_Matrix) <- rownames  
+pval_Matrix <- t(pval_Matrix)
+#pval_Matrix <- pval_Matrix[,df$new_arm]
+pval_Matrix  <- as.matrix(pval_Matrix)
+
+column_label <- gsub("_Status", "", rownames(HR_Matrix))
+# column_label <- gsub("BGsigs_", "", column_label)
+
+
+# Add custom column annotations using grid.text 
+heatmap_obj <- Heatmap(log(HR_Matrix), 
+                       column_title = "Atezo/non-Atezo * gene (High/Low)",
+                       #bottom_annotation = ha,
+                       name = "log HR",
+                       row_labels = column_label,
+                       column_names_gp = grid::gpar(fontsize = 10),
+                       row_names_gp = grid::gpar(fontsize = 10),
+                       cluster_columns = TRUE,
+                       cluster_rows = FALSE,
+                       #column_split = df$STUDY,
+                       column_names_rot = 45,
+                       #heatmap_width = unit(22, "cm"),    # Reduce the width of the heatmap
+                       #heatmap_height = unit(14, "cm"),
+                       cell_fun = function(j, i, x, y, w, h, fill) {
+                         if(pval_Matrix[i, j] < 0.001) {
+                           grid.text("***", x, y, gp=gpar(fontsize = 10))
+                         } else if(pval_Matrix[i, j] < 0.01) {
+                           grid.text("**", x, y,gp=gpar(fontsize = 10))
+                         }  else if(pval_Matrix[i, j] < 0.05) {
+                           grid.text("*", x, y,gp=gpar(fontsize = 10))
+                         }
+                       })
+
+# Move the legend to the left and add a gap
+draw(heatmap_obj, 
+     heatmap_legend_side = "left",  # Position the legend on the left
+     annotation_legend_side = "left")
+
+
+
+#################### Make Forest Plot -----------------------
+
+######### Perform Coxph through nested list
+res.cox.arm <- list()
+res.cox.gene <- list()
+for (i in seq_along(short_df_pdata_merged)) {
+  
+  df <- short_df_pdata_merged[[i]]
+  
+    subset_PARAM <- unique(df$STUDY)
+    
+    res.cox <- vector("list", length(subset_PARAM))  # Pre-allocation for effCPIency
+    
+    for (y in seq_along(subset_PARAM)) {
+      col <- names(df)[11] #### 11 is the Status column
+      # Escape the column name with backticks
+      col <- paste0("`", col, "`")
+      formula <- as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~ CPI_arm *", col))
+      res.cox <- coxph(formula, data = subset(df ,STUDY %in% subset_PARAM[y] ))
+      res.cox.arm[[subset_PARAM[y]]] <- res.cox 
+    }
+    #names(res.cox) <- subset_PARAM
+    res.cox.gene[[i]] <- res.cox.arm 
+  }
+names(res.cox.gene) <- names(short_df_pdata_merged)
+  
+##### Clean up cox result through nested list   
+cox.df <- res.cox.gene %>%
+  purrr::map_depth(2, function(cox_result) {
+    cox_tidy <- broom::tidy(cox_result)
+    # Filter out rows where the variable is, in this case: the example is TLS_B
+    cox_tidy %>%  filter(grepl("CPI:", term))
+  }) %>%
+  purrr::map_depth(1, bind_rows, .id = "STUDY")
+##### Make label for each study
+label_list <- list()
+label_list <- cox.df[[1]][["STUDY"]]
+
+##### rma function
+rma_list <- purrr::map(cox.df, 
+                       ~rma.uni(yi = .$estimate, sei = .$std.error, method = "REML"))
+
+##### Finally make forest plot
+p2 <- list()
+
+for (i in seq_along(rma_list)) {
+  input_list <- rma_list[[i]]
+  title <- names(rma_list)[i]
+  
+   # Open a PDF device before the inner loop
+  #pdf(paste0("forest_plots", title, ".pdf"))
+ 
+  
+    p1 <- forest(input_list, atransf = exp, xlab = "Hazard ratio",slab = paste0(label_list))
+    title(paste0(title,"(ARM * Gene)"))
+   # Close the PDF device after the inner loop
+  #dev.off()
+    p2[[i]] <- p1
+    
+}
+
+
+```
+
+
+## Make forest plot comparing non-Atezo vs Atezo looking at high/low single gene  
+
+```{r}
+###########################  
+gene_of_interest <- c("IRF1", "IRF2","ZBP1") # pick genes, could be a long list of genes
+gene_count  <- subset(filt_count_TPM, row.names(filt_count_TPM) %in% gene_of_interest) %>% t()
+
+######### Make a list of gene by names
+list_gene <- lapply(colnames(gene_count), function(x) gene_count[, x, drop = FALSE])
+names(list_gene ) <- colnames(gene_count)
+
+######### Filter phenotype data to extract important variables
+short_df_pdata <- df_pdata[c("Study_Type","STUDY","CNSR", "colname","OS_month","TRT_CLASS","LIVER_M_AVALC")]
+
+short_df_pdata <- short_df_pdata %>% 
+  mutate(CPI_arm = case_when(
+    grepl(c("atezo|pembrolizumab"), TRT_CLASS) ~ "CPI",
+    grepl("not_treated", TRT_CLASS) ~ "not_treated",
+    TRUE ~ "non_CPI"))
+
+
+short_df_pdata  <- subset(short_df_pdata, !STUDY %in% (c("IMpassion031","CO39721")))
+short_df_pdata <- subset(short_df_pdata, !(STUDY == "IMmotion150" & TRT_CLASS == "atezo_bev"))
+
+short_df_pdata$new_arm <- paste(short_df_pdata$STUDY, short_df_pdata$TRT_CLASS,sep = "_")  
+
+short_df_pdata_sub <- subset(short_df_pdata, short_df_pdata$CPI_arm %in% c("CPI","non_CPI"))
+short_df_pdata_sub$Study_Type <- factor(short_df_pdata_sub$Study_Type, 
+                                 levels = c("Lung Cancer","Bladder Cancer","Renal Cancer","Skin Melanoma",
+                                            "Breast Cancer","GO29779","Colorectal Cancer","Ovarian Cancer"))
+
+# Pick studies with 2 arms
+unique_study_name <- unique(subset(short_df_pdata_sub,short_df_pdata_sub$CPI_arm == "non_CPI")$STUDY)
+short_df_pdata_sub <- subset(short_df_pdata_sub,short_df_pdata_sub$STUDY %in% unique_study_name)   
+
+# Set arm ref
+short_df_pdata_sub$CPI_arm  <- relevel(as.factor(short_df_pdata_sub$CPI_arm), ref = "non_CPI")
+
+short_df_pdata_merged <- lapply(list_gene, function(x) merge(short_df_pdata_sub , x, by.x = "colname", by.y = "row.names"))
+
+short_df_pdata_merged <- lapply(short_df_pdata_merged, function(x) split(x, x$new_arm))
+
+######### Make Low vs High categories for each gene set score and set reference
+for (i in seq_along(short_df_pdata_merged)) {
+  col <- names(short_df_pdata_merged[i])
+  new_col_name <- paste0(col, "_Status")
+  df <- short_df_pdata_merged[[i]]
+  for (g in seq_along(df)) {
+    df[[g]] <- df[[g]] %>%
+      mutate(!!new_col_name := ifelse(.data[[col]] > median(.data[[col]]), "High", "Low")) %>% 
+      mutate(!!new_col_name := relevel(as.factor(.data[[new_col_name]]), ref = "Low"))
+  }
+  short_df_pdata_merged[[i]] <- df
+}
+
+### flatten the new_arms back 1 level
+short_df_pdata_merged <- short_df_pdata_merged %>%
+  purrr::map_depth(1, bind_rows, .id = "new_arm") 
+
+df_nested <- lapply(short_df_pdata_merged, function(x) split(x, x$CPI_arm))
+
+# Function to arrange a dataframe by the Grade column
+arrange_df_by_Study_Type <- function(df) {
+  df %>% arrange(Study_Type)
+}
+
+# Apply the arrange function to each dataframe in the nested list
+df_nested  <- lapply(df_nested, function(inner_list) {
+  lapply(inner_list, arrange_df_by_Study_Type)
+})
+
+subset_PARAM <- unique(short_df_pdata$STUDY) # treatment arm name
+
+
+
+######### Perform Coxph through nested list
+res.cox.arm <- list()
+res.cox.gene <- list()
+for (i in seq_along(df_nested)) {
+  
+  df <- df_nested[[i]]
+  
+  for (a in seq_along(df)) {
+    df1 <- df[[a]]
+    subset_PARAM <- unique(df1$STUDY)
+    
+    res.cox <- vector("list", length(subset_PARAM))  # Pre-allocation for effCPIency
+    
+    for (y in seq_along(subset_PARAM)) {
+      col <- names(df1)[11] #### 11 is the Status column
+      res.cox[[y]] <- coxph(as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~", col)), 
+                            data = subset(df1 , STUDY %in% subset_PARAM[y])) 
+      
+    }
+    names(res.cox) <- subset_PARAM
+    res.cox.arm[[a]] <- res.cox 
+    
+  }
+  names(res.cox.arm) <- names(df)
+  res.cox.gene[[i]] <- res.cox.arm
+  
+}
+names(res.cox.gene) <- names(df_nested)
+
+##### Clean up cox result through nested list   
+cox.df <- res.cox.gene %>%
+  purrr::map_depth(3, broom::tidy) %>%
+  purrr::map_depth(2, bind_rows, .id = "STUDY") 
+
+##### Make label for each treatment arm
+label_list <- list()
+label_list[[1]] <- cox.df[[1]][[1]]$STUDY
+label_list[[2]] <- cox.df[[1]][[2]]$STUDY
+
+##### rma function
+rma_list <- cox.df %>%
+  purrr::map(~ .x %>% 
+               purrr::map(~ rma.uni(yi = .x$estimate, sei = .x$std.error, method = "REML")))
+
+names(rma_list) <- names(df_nested )
+### Label atezo or non-atezo
+fig_label <- unique(short_df_pdata_sub$CPI_arm)
+
+##### Finally make forest plot
+p2 <- list()
+
+for (i in seq_along(rma_list)) {
+  input_list <- rma_list[[i]]
+  title <- names(rma_list)[[i]]
+  
+  # Open a PDF device before the inner loop
+  
+  p1 <- list()
+  
+   for (f in seq_along(input_list)) {
+    p1[[f]] <- forest(input_list[[f]], atransf = exp, xlab = "Hazard ratio", slab = paste0(label_list[[f]]),
+                      main = paste0(title))
+     mtext(fig_label[[f]], side = 3, line = 0.1, cex = 1) 
+    
+    
+  }
+  # Close the PDF device after the inner loop
+
+  p2[[i]] <- p1
+}
+
+```
+
+
+input4_genesets <- "/gne/web/dev/apache/htdocs/people/kayserb/gene_set_collection/WNT-betacat_genesets.rds"
+
+```{r}
+#genes_set <- readRDS(input4_genesets)
+
+genes_set_names <- names(genes_set)
+
+gs_score <- gsva(filt_count_TPM, genes_set, method="zscore")
+gs_score_T <- as.matrix(t(gs_score))
+
+######### Make a list of gene by names
+list_gs_score <- lapply(colnames(gs_score_T), function(x) gs_score_T[, x, drop = FALSE])
+names(list_gs_score ) <- colnames(gs_score_T)
+######### Filter phenotype data to extract important variables
+short_df_pdata <- df_pdata[c("Study_Type","STUDY","CNSR", "colname","OS_month","TRT_CLASS","LIVER_M_AVALC")]
+
+short_df_pdata <- short_df_pdata %>% 
+  mutate(CPI_arm = case_when(
+    grepl(c("atezo|pembrolizumab"), TRT_CLASS) ~ "CPI",
+    grepl("not_treated", TRT_CLASS) ~ "not_treated",
+    TRUE ~ "non_CPI"))
+
+
+short_df_pdata  <- subset(short_df_pdata, !STUDY %in% (c("IMpassion031","CO39721")))
+short_df_pdata <- subset(short_df_pdata, !(STUDY == "IMmotion150" & TRT_CLASS == "atezo_bev"))
+
+short_df_pdata$new_arm <- paste(short_df_pdata$STUDY, short_df_pdata$TRT_CLASS,sep = "_")  
+
+short_df_pdata_sub <- subset(short_df_pdata, short_df_pdata$CPI_arm %in% c("CPI","non_CPI"))
+short_df_pdata_sub$Study_Type <- factor(short_df_pdata_sub$Study_Type, 
+                                 levels = c("Lung Cancer","Bladder Cancer","Renal Cancer","Skin Melanoma",
+                                            "Breast Cancer","GO29779","Colorectal Cancer","Ovarian Cancer"))
+
+# Pick studies with 2 arms
+unique_study_name <- unique(subset(short_df_pdata_sub,short_df_pdata_sub$CPI_arm == "non_CPI")$STUDY)
+short_df_pdata_sub <- subset(short_df_pdata_sub,short_df_pdata_sub$STUDY %in% unique_study_name)   
+
+# Set arm ref
+short_df_pdata_sub$CPI_arm  <- relevel(as.factor(short_df_pdata_sub$CPI_arm), ref = "non_CPI")
+
+short_df_pdata_merged <- lapply(list_gs_score, function(x) merge(short_df_pdata_sub , x, by.x = "colname", by.y = "row.names"))
+
+short_df_pdata_merged <- lapply(short_df_pdata_merged, function(x) split(x, x$STUDY))
+
+######### Make Low vs High categories for each gene set score and set reference
+for (i in seq_along(short_df_pdata_merged)) {
+  col <- names(short_df_pdata_merged[i])
+  new_col_name <- paste0(col, "_Status")
+  df <- short_df_pdata_merged[[i]]
+  for (g in seq_along(df)) {
+    df[[g]] <- df[[g]] %>%
+      mutate(!!new_col_name := ifelse(.data[[col]] > median(.data[[col]]), "High", "Low")) %>% 
+      mutate(!!new_col_name := relevel(as.factor(.data[[new_col_name]]), ref = "Low"))
+  }
+  short_df_pdata_merged[[i]] <- df
+}
+
+### flatten the new_arms back 1 level
+short_df_pdata_merged <- short_df_pdata_merged %>%
+  purrr::map_depth(1, bind_rows, .id = "STUDY") 
+
+
+df_nested <- lapply(short_df_pdata_merged, function(x) split(x, x$CPI_arm))
+
+# Function to arrange a dataframe by the Grade column
+arrange_df_by_Study_Type <- function(df) {
+  df %>% arrange(Study_Type)
+}
+
+# Apply the arrange function to each dataframe in the nested list
+df_nested  <- lapply(df_nested, function(inner_list) {
+  lapply(inner_list, arrange_df_by_Study_Type)
+})
+
+subset_PARAM <- unique(short_df_pdata$STUDY) # treatment arm name
+
+######### Perform Coxph through nested list
+res.cox.arm <- list()
+res.cox.gene <- list()
+for (i in seq_along(df_nested)) {
+  
+  df <- df_nested[[i]]
+  
+  for (a in seq_along(df)) {
+    df1 <- df[[a]]
+    subset_PARAM <- unique(df1$STUDY)
+    
+    res.cox <- vector("list", length(subset_PARAM))  # Pre-allocation for effCPIency
+    
+    for (y in seq_along(subset_PARAM)) {
+      col <- names(df1)[11] #### 11 is the Status column
+      # Escape the column name with backticks
+      col <- paste0("`", col, "`")
+      res.cox[[y]] <- coxph(as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~", col)), 
+                            data = subset(df1 , STUDY %in% subset_PARAM[y] )) 
+      
+    }
+    names(res.cox) <- subset_PARAM
+    res.cox.arm[[a]] <- res.cox 
+    
+  }
+  names(res.cox.arm) <- names(df)
+  res.cox.gene[[i]] <- res.cox.arm
+  
+}
+names(res.cox.gene) <- names(df_nested)
+
+##### Clean up cox result through nested list   
+cox.df <- res.cox.gene %>%
+  purrr::map_depth(3, broom::tidy) %>%
+  purrr::map_depth(2, bind_rows, .id = "treatment_arm") 
+
+##### Make label for each treatment arm
+label_list <- list()
+label_list[[1]] <- cox.df[[1]][[1]]$treatment_arm
+label_list[[2]] <- cox.df[[2]][[2]]$treatment_arm
+
+##### rma function
+rma_list <- cox.df %>%
+  purrr::map(~ .x %>% 
+               purrr::map(~ rma.uni(yi = .x$estimate, sei = .x$std.error, method = "REML")))
+
+names(rma_list) <- names(df_nested )
+##### Finally make forest plot
+fig_label <- unique(short_df_pdata_sub$CPI_arm)
+
+p2 <- list()
+
+for (i in seq_along(rma_list)) {
+  input_list <- rma_list[[i]]
+  title <- names(rma_list)[[i]]
+  
+   # Open a PDF device before the inner loop
+  #pdf(paste0("forest_plots", title, ".pdf"))
+  
+  p1 <- list()
+  
+  for (f in seq_along(input_list)) {
+    p1[[f]] <- forest(input_list[[f]], atransf = exp, xlab = "Hazard ratio", slab = paste0(label_list[[f]]),
+                      main = paste0(title))
+     mtext(fig_label[[f]], side = 3, line = 0.1, cex = 1) 
+    #title(title)
+    
+  }
+  # Close the PDF device after the inner loop
+  #dev.off()
+
+  p2[[i]] <- p1
+} 
+
+
+
+```
+
+
+
+
+## Make coxph output table from a big list of genes
+
+```{r}
+# Start timing
+start_time <- Sys.time()
+# Pick gene
+rownames(filt_count_TPM) <- gsub("[ .:-]", "_", rownames(filt_count_TPM))
+gene_of_interest <- row.names(filt_count_TPM) # example of the first 5000 genes
+
+gene_count  <- subset(filt_count_TPM, row.names(filt_count_TPM) %in% gene_of_interest) %>% t()
+
+list_gene <- lapply(colnames(gene_count), function(x) gene_count[, x, drop = FALSE])
+######### Make a list of gene by names
+#list_gene <- filt_count_TPM %>%
+#  subset(row.names(.) %in% gene_of_interest) %>%
+#  t() %>%
+#  colnames() %>%
+#  lapply(function(x) filt_count_TPM[, x, drop = FALSE])
+names(list_gene ) <- colnames(gene_count)
+
+######### Filter phenotype data to extract important variables
+short_df_pdata <- df_pdata[c("Study_Type","STUDY","CNSR", "colname","OS_month","TRT_CLASS","LIVER_M_AVALC")]
+
+short_df_pdata <- short_df_pdata %>% 
+  mutate(CPI_arm = case_when(
+    grepl(c("atezo|pembrolizumab"), TRT_CLASS) ~ "CPI",
+    grepl("not_treated", TRT_CLASS) ~ "not_treated",
+    TRUE ~ "non_CPI"))
+
+
+#short_df_pdata  <- subset(short_df_pdata, !STUDY %in% (c("IMpassion031","CO39721")))
+#short_df_pdata <- subset(short_df_pdata, !(STUDY == "IMmotion150" & TRT_CLASS == "atezo_bev"))
+### Subset IMblaze370
+short_df_pdata <- subset(short_df_pdata, STUDY %in% "IMblaze370")
+######### Continue to filter data
+short_df_pdata$new_arm <- paste(short_df_pdata$STUDY, short_df_pdata$TRT_CLASS,sep = "_")  
+
+short_df_pdata_sub <- subset(short_df_pdata, short_df_pdata$CPI_arm %in% c("CPI","non_CPI"))
+#short_df_pdata_sub$Study_Type <- factor(short_df_pdata_sub$Study_Type, 
+#                                        levels = c("Lung Cancer","Bladder Cancer","Renal Cancer","Skin Melanoma",
+#                                                   "Breast Cancer","GO29779","Colorectal Cancer","Ovarian Cancer"))
+
+
+# Pick studies with 2 arms
+#unique_study_name <- unique(subset(short_df_pdata_sub,short_df_pdata_sub$CPI_arm == "non_CPI")$STUDY)
+#short_df_pdata_sub <- subset(short_df_pdata_sub,short_df_pdata_sub$STUDY %in% unique_study_name)   
+
+# Set arm ref
+short_df_pdata_sub$CPI_arm  <- relevel(as.factor(short_df_pdata_sub$CPI_arm), ref = "non_CPI")
+
+short_df_pdata_merged <- lapply(list_gene, function(x) merge(short_df_pdata_sub , x, by.x = "colname", by.y = "row.names"))
+
+short_df_pdata_merged <- lapply(short_df_pdata_merged, function(x) split(x, x$CPI_arm))
+
+######### Make Low vs High categories for each gene set score and set reference
+for (i in seq_along(short_df_pdata_merged)) {
+  col <- names(short_df_pdata_merged[i])
+  new_col_name <- paste0(col, "_Status")
+  df <- short_df_pdata_merged[[i]]
+  for (g in seq_along(df)) {
+    df[[g]] <- df[[g]] %>%
+      mutate(!!new_col_name := ifelse(.data[[col]] > median(.data[[col]]), "High", "Low")) %>% 
+      mutate(!!new_col_name := relevel(as.factor(.data[[new_col_name]]), ref = "Low"))
+  }
+  short_df_pdata_merged[[i]] <- df
+}
+df_nested <- short_df_pdata_merged
+### flatten the new_arms back 1 level
+#short_df_pdata_merged <- short_df_pdata_merged %>%
+#  purrr::map_depth(1, bind_rows, .id = "CPI_arm") 
+
+#df_nested <- lapply(short_df_pdata_merged, function(x) split(x, x$CPI_arm))
+
+
+subset_PARAM <- unique(short_df_pdata$STUDY) # treatment arm name
+
+# Define a function to run Coxph for a subset of df1
+run_coxph <- function(df1, subset_PARAM) {
+  res.cox <- vector("list", length(subset_PARAM))  # Pre-allocation
+  for (y in seq_along(subset_PARAM)) {
+    col <- names(df1)[11]  # 11 is the Status column
+    res.cox [[y]] <- coxph(as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~", col)), 
+                           data = subset(df1, STUDY %in% subset_PARAM[y]))
+  }
+  names(res.cox ) <- subset_PARAM
+  return(res.cox )
+}
+
+# Perform Coxph through nested list in parallel
+res.cox.gene <- future_lapply(df_nested, function(df) {
+  res.cox.arm <- lapply(df, function(df1) {
+    subset_PARAM <- unique(df1$STUDY)
+    run_coxph(df1, subset_PARAM)
+  })
+  names(res.cox.arm) <- names(df)
+  return(res.cox.arm)
+})
+
+
+# Name the result list
+names(res.cox.gene) <- names(df_nested)
+
+##### Clean up cox result through nested list   
+
+cox.df <- res.cox.gene %>%
+  purrr::map_depth(3, broom::tidy,conf.int = TRUE) %>%
+  purrr::map_depth(2, bind_rows, .id = "STUDY") 
+   
+big_df<- cox.df %>%
+    map_dfr(~ bind_rows(.x[[1]], .x[[2]], .id = "Drug_Class"), .id = "Genes")
+
+big_df   <- big_df   %>%
+  mutate(Drug_Class = case_when(
+    Drug_Class ==  "1" ~ "Non_Atezo",
+    Drug_Class ==  "2" ~ "Atezo"))
+
+
+
+# End timing
+end_time <- Sys.time()
+
+# Calculate the elapsed time
+elapsed_time <- end_time - start_time
+
+# Print the elapsed time
+print(elapsed_time)
+
+
+```
+## Adjusted for Purity 
+```{r}
+
+
+######### Perform Coxph through nested list with purity adjusted
+res.cox.arm <- list()
+res.cox.gene <- list()
+for (i in seq_along(df_nested)) {
+  
+  df <- df_nested[[i]]
+  
+  for (a in seq_along(df)) {
+    df1 <- df[[a]]
+    subset_PARAM <- unique(df1$new_arm)
+    
+    res.cox <- vector("list", length(subset_PARAM))  # Pre-allocation for effCPIency
+    
+    for (y in seq_along(subset_PARAM)) {
+      col <- names(df1)[11] #### 9 is the Status column
+      res.cox[[y]] <- coxph(as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~", paste(col, "(purity,3)", sep = " + splines::ns"))), 
+                            data = subset(df1 , new_arm %in% subset_PARAM[y])) 
+        
+    }
+    names(res.cox) <- subset_PARAM
+    res.cox.arm[[a]] <- res.cox 
+    
+  }
+  names(res.cox.arm) <- names(df)
+  res.cox.gene[[i]] <- res.cox.arm
+  
+}
+names(res.cox.gene) <- names(df_nested)
+
+
+##### Clean up cox result through nested list   
+cox.df <- res.cox.gene %>%
+  purrr::map_depth(3, function(cox_result) {
+    cox_tidy <- broom::tidy(cox_result,conf.int = TRUE)
+    # Filter out rows where the variable is, in this case: the example is TLS_B
+    cox_tidy %>%  filter(!grepl("splines::ns", term))
+  }) %>%
+  purrr::map_depth(2, bind_rows, .id = "STUDY") 
+
+cox.df <- res.cox.gene %>%
+  purrr::map_depth(3, broom::tidy,conf.int = TRUE) %>%
+  purrr::map_depth(2, bind_rows, .id = "STUDY") 
+   
+big_df <- cox.df %>%
+    map_dfr(~ bind_rows(.x[[1]], .x[[2]], .id = "Drug_Class"), .id = "Genes")
+
+big_df  <- big_df  %>%
+  mutate(Drug_Class = case_when(
+    Drug_Class ==  "1" ~ "Atezo",
+    Drug_Class ==  "2" ~ "Non_Atezo"))
+
+
+```
+
+## Make Forest Plot for CIT Phenotype by classifiers
+
+```{r}
+
+##################### Classification of CIT
+library(cd8ippred)
+library(DESeq2)
+raw_count  <- assay(se.bind, "counts")
+rownames(raw_count) = rowData(se.bind)$symbol
+# Convert matrix to dataframe
+raw_count <- as.data.frame(raw_count)
+# Create a DESeq2 object
+dds <- DESeqDataSetFromMatrix(countData = as.matrix(raw_count) ,
+                              colData = df_pdata[1:5],
+                              design = ~ 1)
+# Estimate size factors
+dds <- estimateSizeFactors(dds)
+# Perform the variance stabilizing transformation (VST)
+vst_data <- vst(dds)
+vst_counts <- assay(vst_data)
+vst_counts_T <- t(vst_counts)
+pred <- predict_cd8ip(as.data.frame(vst_counts_T))
+# Replace NA values with "unknown" in the 'category' column
+#pred$predicted.class[is.na(pred$predicted.class)] <- "unknown"
+
+######### Filter phenotype data to extract important variables
+short_df_pdata <- df_pdata[c("STUDY","Study_Type","CNSR", "colname","OS_month","TRT_CLASS")]
+### Make CPI arm
+short_df_pdata <- short_df_pdata %>% 
+   mutate(CPI_arm = case_when(
+    grepl(c("atezo|pembrolizumab"), TRT_CLASS) ~ "CPI",
+    grepl("not_treated", TRT_CLASS) ~ "not_treated",
+    TRUE ~ "non_CPI"))
+
+
+short_df_pdata  <- subset(short_df_pdata, !STUDY %in% (c("IMpassion031","CO39721")))
+
+short_df_pdata$new_arm <- paste(short_df_pdata$STUDY, short_df_pdata$TRT_CLASS,sep = "_")  
+
+#### Extract CIT Phenotype
+pred <- pred %>%
+     mutate(probs.class = case_when(
+         predicted.class == "inflamed" ~ prob.inflamed,
+         predicted.class == "excluded" ~ prob.excluded,
+         predicted.class == "desert" ~ prob.desert
+     ))
+CIT_Phenotype <- pred[,c(4,6)]
+
+short_df_pdata <- merge(short_df_pdata, CIT_Phenotype, by.x="colname", by.y="row.names")
+
+short_df_pdata_sub <- subset(short_df_pdata, short_df_pdata$CPI_arm %in% c("CPI","non_CPI"))
+
+short_df_pdata_sub$Study_Type <- factor(short_df_pdata_sub$Study_Type, 
+                                 levels = c("Lung Cancer","Bladder Cancer","Renal Cancer","Skin Melanoma",
+                                            "Breast Cancer","GO29779","Colorectal Cancer","Ovarian Cancer"))
+
+# Set arm ref
+short_df_pdata_sub$predicted.class  <- relevel(as.factor(short_df_pdata_sub$predicted.class), ref = "desert")
+
+short_df_pdata_merged <- split(short_df_pdata_sub, short_df_pdata_sub$CPI_arm)
+
+df_nested <- short_df_pdata_merged 
+# Apply the arrange function to each dataframe in the nested list
+df_nested <- lapply(df_nested, function(df) {
+  df %>% arrange(Study_Type)
+})
+
+##### Run coxph
+res.cox.arm <- list()
+for (a in seq_along(df_nested)) {
+  df1 <- df_nested[[a]]
+  subset_PARAM <- unique(df1$new_arm)
+  
+  res.cox <- vector("list", length(subset_PARAM))  # Pre-allocation for effCPIency
+  
+  for (y in seq_along(subset_PARAM)) {
+    col <- names(df1)[9] #### pick variable for comparison is the Status column
+    res.cox[[y]] <- coxph(as.formula(paste("Surv(OS_month, as.numeric(CNSR)) ~", col)), 
+                          data = subset(df1 , new_arm %in% subset_PARAM[y] 
+                          & predicted.class %in% "excluded" )) 
+    
+  }
+  names(res.cox) <- subset_PARAM
+  res.cox.arm[[a]] <- res.cox 
+  
+}
+names( res.cox.arm) <- names(df_nested)
+
+##### Clean up cox result through nested list   
+
+cox.df <- res.cox.arm %>%
+  purrr::map_depth(2, function(cox_result) {
+    cox_tidy <- broom::tidy(cox_result)
+    # Filter out rows where the variable is, in this case: the example is TLS_B
+    #cox_tidy %>%  filter(grepl("inflamed", term))  #change inflamed or excluded
+  }) %>%
+  purrr::map_depth(1, bind_rows, .id = "STUDY")
+
+rma_list <- purrr::map(cox.df, 
+                       ~rma.uni(yi = .$estimate, sei = .$std.error, method = "REML"))
+##### Make label for each treatment arm
+label_list <- list()
+label_list[[1]] <- cox.df[[1]]$STUDY
+label_list[[2]] <- cox.df[[2]]$STUDY
+##### Finally make forest plot
+p2 <- list()
+
+for (i in seq_along(rma_list)) {
+  input_list <- rma_list[[i]]
+  title <- names(rma_list)[i]
+  
+  # Open a PDF device before the inner loop
+ 
+  
+    p1 <- forest(input_list, atransf = exp, xlab = "Hazard ratio",slab = paste0(label_list[[i]]))
+    title("tGFB High vs Low")
+  
+    p2[[i]] <- p1
+    
+}
+
+survfit2(Surv(OS_month, as.numeric(CNSR)) ~ predicted.class, 
+         data = subset(IMblaze370, CPI_arm %in% "CPI"))  %>% 
+  ggsurvplot(surv.median.line = "hv",risk.table = TRUE,pval = TRUE,
+             palette = c("purple3", "green3", "red3"), color = "predicted.class") +
+  labs(
+    x = "Months",
+    y = "OS probability") 
+
+
+
+```
