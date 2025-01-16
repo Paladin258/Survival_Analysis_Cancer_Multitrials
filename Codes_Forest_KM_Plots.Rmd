@@ -1,6 +1,6 @@
 ---
-title: "Codes_Forest_KM_Plots"
-author: "Nam/Brandon"
+title: "KM Survival Analysis"
+author: "Nam V. Nguyen"
 date: "3/27/2024"
 output: html_document
 ---
@@ -33,7 +33,6 @@ library(ggsurvfit)
 library(gtsummary)
 library(colorspace)
 library(tidycmprsk)
-#library(condsurv)
 library(survminer)
 library(GSVA)
 library(mice)
@@ -46,7 +45,7 @@ library(future.apply)
 ```
 
 
-## Load Data
+## Load Clinical Data
 ```{r}
 se.bind <- readRDS("/gstore/project/nam_metadata_analysis/Working_Data/se.bind_V5.rds") ## Load SE object
 df_pdata  <- as.data.frame(colData(se.bind)) ## Load phenotype data
